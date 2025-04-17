@@ -83,12 +83,13 @@ struct CANARD : BidooModule {
 	std::string lastPath;
 	std::string waveFileName;
 	std::string waveExtension;
-	bool loading = false;
+	std::atomic<bool> loading = false;
 	dsp::SchmittTrigger trigTrigger;
 	dsp::SchmittTrigger recordTrigger;
 	dsp::SchmittTrigger clearTrigger;
 	dsp::PulseGenerator eocPulse;
 	std::atomic<bool> locked{false};
+	std::atomic<bool> lock_requested{false};
 	bool newStop = false;
 	bool first=true;
 
@@ -153,6 +154,11 @@ struct CANARD : BidooModule {
 		}
 	}
 
+	bool try_lock() {
+		bool expected = false;
+		return locked.compare_exchange_strong(expected, true);
+	}
+
 	void unlock() {
 		locked.store(false);
 	}
@@ -172,13 +178,14 @@ struct CANARD : BidooModule {
 	}
 
 	void dataFromJson(json_t *rootJ) override {
+		printf("CANARD::dataFromJson\n");
 		BidooModule::dataFromJson(rootJ);
 		json_t *lastPathJ = json_object_get(rootJ, "lastPath");
 		if (lastPathJ) {
 			lastPath = json_string_value(lastPathJ);
 			waveFileName = rack::system::getFilename(lastPath);
 			waveExtension = rack::system::getExtension(lastPath);
-			if (!lastPath.empty()) loadSample();
+			if (!lastPath.empty()) loadSampleInternal();
 			if (totalSampleCount>0) {
 				json_t *slicesJ = json_object_get(rootJ, "slices");
 				if (slicesJ) {
@@ -232,6 +239,9 @@ void CANARD::calcTransients() {
 }
 
 void CANARD::loadSampleInternal() {
+	// On MM, this is called during audio startup (dataFromJson)
+	// and in the AsyncThread context
+
 	APP->engine->yieldWorkers();
 	
 	// Get extension and validate
@@ -246,18 +256,40 @@ void CANARD::loadSampleInternal() {
 		return;
 	}
 	
+#if defined(METAMODULE)
+	// Try to get the lock from the GUI thread
+	// If we fail (i.e. GUI thread is using the buffer),
+	// then queue our request to get the lock next
+	// `loading` will stay true, so the audio process
+	// will continue to run this thread
+	if (!try_lock()){
+		lock_requested.store(true);
+		return;
+	}
+	lock_requested.store(false);
+#else
 	lock();
-	playBuffer = waves::getStereoWav(lastPath, APP->engine->getSampleRate(), waveFileName, waveExtension, channels, sampleRate, totalSampleCount);
-	unlock();
-	slices.clear();
+#endif
+
+	// Set loading false as soon as we can, so audio does not call this thread again
+	// TODO: would it be better to not use run_once but instead have this thread monitor for a flag to load a sample?
+
 	loading = false;
+	playBuffer = waves::getStereoWav(lastPath, APP->engine->getSampleRate(), waveFileName, waveExtension, channels, sampleRate, totalSampleCount);
+	slices.clear();
 
 	vector<dsp::Frame<2>>(playBuffer).swap(playBuffer);
+
+	// unlock should be done last, after all buffers
+	unlock();
 }
 
 void CANARD::loadSample() {
+	// On MM, this is only called from the audio context
+
 #if defined(METAMODULE)
-	loadSampleAsync.run_once();
+	if (!loadSampleAsync.is_enabled())
+		loadSampleAsync.run_once();
 #else
 	loadSampleInternal();
 #endif
@@ -265,15 +297,23 @@ void CANARD::loadSample() {
 
 void CANARD::saveSampleInternal() {
 	APP->engine->yieldWorkers();
+
+#if defined(METAMODULE)
+	if (!try_lock())
+		return;
+#else
 	lock();
+#endif
+
 	waves::saveWave(playBuffer, APP->engine->getSampleRate(), lastPath);
-	unlock();
 	save = false;
+	unlock();
 }
 
 void CANARD::saveSample() {
 #if defined(METAMODULE)
-	saveSampleAsync.run_once();
+	if (!saveSampleAsync.is_enabled())
+		saveSampleAsync.run_once();
 #else
 	saveSampleInternal();
 #endif
@@ -327,11 +367,16 @@ void CANARD::process(const ProcessArgs &args) {
 
 	if (clearTrigger.process(inputs[CLEAR_INPUT].getVoltage() + params[CLEAR_PARAM].getValue()))
 	{
+#if !defined(METAMODULE)
+		// Can't spin lock in the audio process
 		lock();
+#endif
 		playBuffer.clear();
 		totalSampleCount = 0;
 		slices.clear();
+#if !defined(METAMODULE)
 		unlock();
+#endif
 		lastPath = "";
 		waveFileName = "";
 		waveExtension = "";
@@ -627,155 +672,157 @@ struct CANARDDisplay : OpaqueWidget {
 	void drawLayer(const DrawArgs& args, int layer) override {
 		if (layer == 1) {
 			if (module && (module->playBuffer.size()>0)) {
-				module->lock();
-				std::vector<int> s(module->slices);
-				module->unlock();
-				size_t nbSample = module->totalSampleCount;
+				if (!module->lock_requested && module->try_lock()) {
+					std::vector<int> s(module->slices);
+					size_t nbSample = module->totalSampleCount;
 
-				nvgScissor(args.vg, 0, 0, width, 2*height+10);
+					nvgScissor(args.vg, 0, 0, width, 2*height+10);
 
-				// Draw play line
-				if (!module->loading) {
-					nvgStrokeColor(args.vg, LIGHTBLUE_BIDOO);
+					// Draw play line
+					if (!module->loading) {
+						nvgStrokeColor(args.vg, LIGHTBLUE_BIDOO);
+						{
+							nvgBeginPath(args.vg);
+							nvgStrokeWidth(args.vg, 2);
+							if (nbSample>0) {
+								nvgMoveTo(args.vg, module->samplePos * zoomWidth / nbSample + zoomLeftAnchor, 0);
+								nvgLineTo(args.vg, module->samplePos * zoomWidth / nbSample + zoomLeftAnchor, 2*height+10);
+							}
+							else {
+								nvgMoveTo(args.vg, 0, 0);
+								nvgLineTo(args.vg, 0, 2*height+10);
+							}
+							nvgClosePath(args.vg);
+						}
+						nvgStroke(args.vg);
+					}
+
+					// Draw ref line
+					nvgStrokeColor(args.vg, nvgRGBA(0xff, 0xff, 0xff, 0x30));
+					nvgStrokeWidth(args.vg, 1);
 					{
 						nvgBeginPath(args.vg);
-						nvgStrokeWidth(args.vg, 2);
-						if (nbSample>0) {
-							nvgMoveTo(args.vg, module->samplePos * zoomWidth / nbSample + zoomLeftAnchor, 0);
-							nvgLineTo(args.vg, module->samplePos * zoomWidth / nbSample + zoomLeftAnchor, 2*height+10);
-						}
-						else {
-							nvgMoveTo(args.vg, 0, 0);
-							nvgLineTo(args.vg, 0, 2*height+10);
-						}
+						nvgMoveTo(args.vg, 0, height/2);
+						nvgLineTo(args.vg, width, height/2);
 						nvgClosePath(args.vg);
 					}
 					nvgStroke(args.vg);
-				}
 
-				// Draw ref line
-				nvgStrokeColor(args.vg, nvgRGBA(0xff, 0xff, 0xff, 0x30));
-				nvgStrokeWidth(args.vg, 1);
-				{
-					nvgBeginPath(args.vg);
-					nvgMoveTo(args.vg, 0, height/2);
-					nvgLineTo(args.vg, width, height/2);
-					nvgClosePath(args.vg);
-				}
-				nvgStroke(args.vg);
-
-				nvgStrokeColor(args.vg, nvgRGBA(0xff, 0xff, 0xff, 0x30));
-				nvgStrokeWidth(args.vg, 1);
-				{
-					nvgBeginPath(args.vg);
-					nvgMoveTo(args.vg, 0, 3*height*0.5f+10);
-					nvgLineTo(args.vg, width, 3*height*0.5f+10);
-					nvgClosePath(args.vg);
-				}
-				nvgStroke(args.vg);
-
-				if ((!module->loading) && (nbSample>0)) {
-
-					// Draw loop
-					nvgFillColor(args.vg, nvgRGBA(255, 255, 255, 60));
+					nvgStrokeColor(args.vg, nvgRGBA(0xff, 0xff, 0xff, 0x30));
 					nvgStrokeWidth(args.vg, 1);
-					nvgBeginPath(args.vg);
-					nvgMoveTo(args.vg, (module->sampleStart + module->fadeLenght) * zoomWidth / nbSample + zoomLeftAnchor, 0);
-					nvgLineTo(args.vg, module->sampleStart * zoomWidth / nbSample + zoomLeftAnchor, 2*height+10);
-					nvgLineTo(args.vg, (module->sampleStart + module->loopLength) * zoomWidth / nbSample + zoomLeftAnchor, 2*height+10);
-					nvgLineTo(args.vg, (module->sampleStart + module->loopLength - module->fadeLenght) * zoomWidth / nbSample + zoomLeftAnchor, 0);
-					nvgLineTo(args.vg, (module->sampleStart + module->fadeLenght) * zoomWidth / nbSample + zoomLeftAnchor, 0);
-					nvgClosePath(args.vg);
-					nvgFill(args.vg);
-
-					//draw selected
-					if ((module->selected >= 0) && ((size_t)module->selected < s.size()) && (floor(module->params[CANARD::MODE_PARAM].getValue()) == 1)) {
-						nvgStrokeColor(args.vg, RED_BIDOO);
-							nvgBeginPath(args.vg);
-						nvgStrokeWidth(args.vg, 4);
-						nvgMoveTo(args.vg, (s[module->selected] * zoomWidth / nbSample) + zoomLeftAnchor , 2*height+9);
-						if ((size_t)module->selected < (s.size()-1))
-							nvgLineTo(args.vg, (s[module->selected+1] * zoomWidth / nbSample) + zoomLeftAnchor , 2*height+9);
-						else
-							nvgLineTo(args.vg, zoomWidth + zoomLeftAnchor, 2*height+9);
+					{
+						nvgBeginPath(args.vg);
+						nvgMoveTo(args.vg, 0, 3*height*0.5f+10);
+						nvgLineTo(args.vg, width, 3*height*0.5f+10);
 						nvgClosePath(args.vg);
-						nvgStroke(args.vg);
 					}
+					nvgStroke(args.vg);
 
-					// Draw waveform
+					if ((!module->loading) && (nbSample>0)) {
 
-					if (nbSample>0) {
-						nvgStrokeColor(args.vg, PINK_BIDOO);
-						nvgSave(args.vg);
-						Rect b = Rect(Vec(zoomLeftAnchor, 0), Vec(zoomWidth, height));
-						float invNbSample = 1.0f / nbSample;
-						size_t inc = std::max(nbSample/zoomWidth/4,1.f);
-						nvgBeginPath(args.vg);
-						for (size_t i = 0; i < nbSample; i+=inc) {
-							float x, y;
-							x = (float)i * invNbSample ;
-							y = (-1.f)*module->playBuffer[i].samples[0] * 0.5f + 0.5f;
-							Vec p;
-							p.x = b.pos.x + b.size.x * x;
-							p.y = b.pos.y + b.size.y * (1.0f - y);
-							if (i == 0) {
-								nvgMoveTo(args.vg, p.x, p.y);
-							}
-							else {
-								nvgLineTo(args.vg, p.x, p.y);
-							}
-						}
-
-						nvgLineCap(args.vg, NVG_MITER);
+						// Draw loop
+						nvgFillColor(args.vg, nvgRGBA(255, 255, 255, 60));
 						nvgStrokeWidth(args.vg, 1);
-						nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
-						nvgStroke(args.vg);
-
-						b = Rect(Vec(zoomLeftAnchor, height+10), Vec(zoomWidth, height));
 						nvgBeginPath(args.vg);
-						for (size_t i = 0; i < nbSample; i+=inc) {
-							float x, y;
-							x = (float)i * invNbSample;
-							y = (-1.f)*module->playBuffer[i].samples[1] * 0.5f + 0.5f;
-							Vec p;
-							p.x = b.pos.x + b.size.x * x;
-							p.y = b.pos.y + b.size.y * (1.0f - y);
-							if (i == 0)
-								nvgMoveTo(args.vg, p.x, p.y);
-							else {
-								nvgLineTo(args.vg, p.x, p.y);
-							}
-						}
-						nvgLineCap(args.vg, NVG_MITER);
-						nvgStrokeWidth(args.vg, 1);
-						nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
-						nvgStroke(args.vg);
-					}
+						nvgMoveTo(args.vg, (module->sampleStart + module->fadeLenght) * zoomWidth / nbSample + zoomLeftAnchor, 0);
+						nvgLineTo(args.vg, module->sampleStart * zoomWidth / nbSample + zoomLeftAnchor, 2*height+10);
+						nvgLineTo(args.vg, (module->sampleStart + module->loopLength) * zoomWidth / nbSample + zoomLeftAnchor, 2*height+10);
+						nvgLineTo(args.vg, (module->sampleStart + module->loopLength - module->fadeLenght) * zoomWidth / nbSample + zoomLeftAnchor, 0);
+						nvgLineTo(args.vg, (module->sampleStart + module->fadeLenght) * zoomWidth / nbSample + zoomLeftAnchor, 0);
+						nvgClosePath(args.vg);
+						nvgFill(args.vg);
 
-					//draw slices
-
-					if (floor(module->params[CANARD::MODE_PARAM].getValue()) == 1) {
-						for (size_t i = 0; i < s.size(); i++) {
-							if (s[i] != module->deleteSliceMarker) {
-								nvgStrokeColor(args.vg, YELLOW_BIDOO);
-							}
-							else {
-								nvgStrokeColor(args.vg, RED_BIDOO);
-							}
-							nvgStrokeWidth(args.vg, 1);
-							{
+						//draw selected
+						if ((module->selected >= 0) && ((size_t)module->selected < s.size()) && (floor(module->params[CANARD::MODE_PARAM].getValue()) == 1)) {
+							nvgStrokeColor(args.vg, RED_BIDOO);
 								nvgBeginPath(args.vg);
-								nvgMoveTo(args.vg, s[i] * zoomWidth / nbSample + zoomLeftAnchor , 0);
-								nvgLineTo(args.vg, s[i] * zoomWidth / nbSample + zoomLeftAnchor , 2*height+10);
-								nvgClosePath(args.vg);
-							}
+							nvgStrokeWidth(args.vg, 4);
+							nvgMoveTo(args.vg, (s[module->selected] * zoomWidth / nbSample) + zoomLeftAnchor , 2*height+9);
+							if ((size_t)module->selected < (s.size()-1))
+								nvgLineTo(args.vg, (s[module->selected+1] * zoomWidth / nbSample) + zoomLeftAnchor , 2*height+9);
+							else
+								nvgLineTo(args.vg, zoomWidth + zoomLeftAnchor, 2*height+9);
+							nvgClosePath(args.vg);
 							nvgStroke(args.vg);
 						}
-					}
 
+						// Draw waveform
+
+						if (nbSample>0) {
+							nvgStrokeColor(args.vg, PINK_BIDOO);
+							nvgSave(args.vg);
+							Rect b = Rect(Vec(zoomLeftAnchor, 0), Vec(zoomWidth, height));
+							float invNbSample = 1.0f / nbSample;
+							size_t inc = std::max(nbSample/zoomWidth/4,1.f);
+							nvgBeginPath(args.vg);
+							for (size_t i = 0; i < nbSample; i+=inc) {
+								float x, y;
+								x = (float)i * invNbSample ;
+								y = (-1.f)*module->playBuffer[i].samples[0] * 0.5f + 0.5f;
+								Vec p;
+								p.x = b.pos.x + b.size.x * x;
+								p.y = b.pos.y + b.size.y * (1.0f - y);
+								if (i == 0) {
+									nvgMoveTo(args.vg, p.x, p.y);
+								}
+								else {
+									nvgLineTo(args.vg, p.x, p.y);
+								}
+							}
+
+							nvgLineCap(args.vg, NVG_MITER);
+							nvgStrokeWidth(args.vg, 1);
+							nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+							nvgStroke(args.vg);
+
+							b = Rect(Vec(zoomLeftAnchor, height+10), Vec(zoomWidth, height));
+							nvgBeginPath(args.vg);
+							for (size_t i = 0; i < nbSample; i+=inc) {
+								float x, y;
+								x = (float)i * invNbSample;
+								y = (-1.f)*module->playBuffer[i].samples[1] * 0.5f + 0.5f;
+								Vec p;
+								p.x = b.pos.x + b.size.x * x;
+								p.y = b.pos.y + b.size.y * (1.0f - y);
+								if (i == 0)
+									nvgMoveTo(args.vg, p.x, p.y);
+								else {
+									nvgLineTo(args.vg, p.x, p.y);
+								}
+							}
+							nvgLineCap(args.vg, NVG_MITER);
+							nvgStrokeWidth(args.vg, 1);
+							nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+							nvgStroke(args.vg);
+						}
+
+						//draw slices
+
+						if (floor(module->params[CANARD::MODE_PARAM].getValue()) == 1) {
+							for (size_t i = 0; i < s.size(); i++) {
+								if (s[i] != module->deleteSliceMarker) {
+									nvgStrokeColor(args.vg, YELLOW_BIDOO);
+								}
+								else {
+									nvgStrokeColor(args.vg, RED_BIDOO);
+								}
+								nvgStrokeWidth(args.vg, 1);
+								{
+									nvgBeginPath(args.vg);
+									nvgMoveTo(args.vg, s[i] * zoomWidth / nbSample + zoomLeftAnchor , 0);
+									nvgLineTo(args.vg, s[i] * zoomWidth / nbSample + zoomLeftAnchor , 2*height+10);
+									nvgClosePath(args.vg);
+								}
+								nvgStroke(args.vg);
+							}
+						}
+
+					}
+					nvgResetScissor(args.vg);
+					nvgRestore(args.vg);
+
+					module->unlock();
 				}
-				nvgResetScissor(args.vg);
-				nvgRestore(args.vg);
 			}
 		}
 		Widget::drawLayer(args, layer);
