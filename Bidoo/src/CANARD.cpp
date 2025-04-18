@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include "dep/waves.hpp"
+#include "../debug_raw.h"
 
 #if defined(METAMODULE)
 #include "async_filebrowser.hh"
@@ -62,7 +63,7 @@ struct CANARD : BidooModule {
 	bool save = false;
 	int channels = 2;
 	int sampleRate = 0;
-  int totalSampleCount = 0;
+	int totalSampleCount = 0;
 	vector<dsp::Frame<2>> playBuffer, recordBuffer;
 	float samplePos = 0.0f, sampleStart = 0.0f, loopLength = 0.0f, fadeLenght = 0.0f, fadeCoeff = 1.0f, speedFactor = 1.0f;
 	size_t prevPlayedSlice = 0;
@@ -84,18 +85,22 @@ struct CANARD : BidooModule {
 	std::string waveFileName;
 	std::string waveExtension;
 	std::atomic<bool> loading = false;
+	bool clear_requested = false;
 	dsp::SchmittTrigger trigTrigger;
 	dsp::SchmittTrigger recordTrigger;
 	dsp::SchmittTrigger clearTrigger;
 	dsp::PulseGenerator eocPulse;
 	std::atomic<bool> locked{false};
-	std::atomic<bool> lock_requested{false};
 	bool newStop = false;
 	bool first=true;
 
 #if defined(METAMODULE)
 	MetaModule::AsyncThread loadSampleAsync{this, [this]() {
-		this->loadSampleInternal();
+		DebugPin3High();
+		if (loading.load(std::memory_order_acquire)) {
+			this->loadSampleInternal();
+		}
+		DebugPin3Low();
 	}};
 	
 	MetaModule::AsyncThread saveSampleAsync{this, [this]() {
@@ -135,6 +140,11 @@ struct CANARD : BidooModule {
 		configOutput(OUTL_OUTPUT, "Out L");
 		configOutput(OUTR_OUTPUT, "Out R");
 		configOutput(EOC_OUTPUT, "EOC");
+
+#if defined(METAMODULE)
+		loadSampleAsync.start();
+		printf("CANARD: module is %p\n", this);
+#endif
 	}
 
 	void process(const ProcessArgs &args) override;
@@ -240,7 +250,7 @@ void CANARD::calcTransients() {
 
 void CANARD::loadSampleInternal() {
 	// On MM, this is called during audio startup (dataFromJson)
-	// and in the AsyncThread context
+	// and in the AsyncThread context when loading == true
 
 	APP->engine->yieldWorkers();
 	
@@ -257,40 +267,29 @@ void CANARD::loadSampleInternal() {
 	}
 	
 #if defined(METAMODULE)
-	// Try to get the lock from the GUI thread
-	// If we fail (i.e. GUI thread is using the buffer),
-	// then queue our request to get the lock next
-	// `loading` will stay true, so the audio process
-	// will continue to run this thread
-	if (!try_lock()){
-		lock_requested.store(true);
+	// Try to get the lock from the GUI thread. If we fail (i.e. GUI thread is using the buffer),
+	// then `loading` will stay true so we'll try again the next time the AsyncThread is scheduled.
+	if (!try_lock())
 		return;
-	}
-	lock_requested.store(false);
 #else
 	lock();
 #endif
 
-	// Set loading false as soon as we can, so audio does not call this thread again
-	// TODO: would it be better to not use run_once but instead have this thread monitor for a flag to load a sample?
-
-	loading = false;
 	playBuffer = waves::getStereoWav(lastPath, APP->engine->getSampleRate(), waveFileName, waveExtension, channels, sampleRate, totalSampleCount);
-	slices.clear();
-
 	vector<dsp::Frame<2>>(playBuffer).swap(playBuffer);
 
-	// unlock should be done last, after all buffers
+	slices.clear();
+
+	// unlock must be done after we're done accessing playBuffer and slices
 	unlock();
+
+	loading = false;
 }
 
 void CANARD::loadSample() {
 	// On MM, this is only called from the audio context
 
-#if defined(METAMODULE)
-	if (!loadSampleAsync.is_enabled())
-		loadSampleAsync.run_once();
-#else
+#if !defined(METAMODULE)
 	loadSampleInternal();
 #endif
 }
@@ -306,8 +305,9 @@ void CANARD::saveSampleInternal() {
 #endif
 
 	waves::saveWave(playBuffer, APP->engine->getSampleRate(), lastPath);
-	save = false;
 	unlock();
+
+	save = false;
 }
 
 void CANARD::saveSample() {
@@ -357,6 +357,7 @@ void CANARD::initPos() {
 }
 
 void CANARD::process(const ProcessArgs &args) {
+#if !defined(METAMODULE)
 	if (loading) {
 		loadSample();
 	}
@@ -364,22 +365,31 @@ void CANARD::process(const ProcessArgs &args) {
 	if (save) {
 		saveSample();
 	}
+#endif
 
 	if (clearTrigger.process(inputs[CLEAR_INPUT].getVoltage() + params[CLEAR_PARAM].getValue()))
 	{
-#if !defined(METAMODULE)
-		// Can't spin lock in the audio process
+		clear_requested = true;
+	}
+
+	if (clear_requested)
+	{
+#if defined(METAMODULE)
+		if (try_lock()) {
+#else
 		lock();
 #endif
 		playBuffer.clear();
 		totalSampleCount = 0;
 		slices.clear();
-#if !defined(METAMODULE)
-		unlock();
+#if defined(METAMODULE)
+		}
 #endif
+		unlock();
 		lastPath = "";
 		waveFileName = "";
 		waveExtension = "";
+		clear_requested = false;
 	}
 
 	if ((selected>=0) && (deleteFlag)) {
@@ -672,7 +682,7 @@ struct CANARDDisplay : OpaqueWidget {
 	void drawLayer(const DrawArgs& args, int layer) override {
 		if (layer == 1) {
 			if (module && (module->playBuffer.size()>0)) {
-				if (!module->lock_requested && module->try_lock()) {
+				if (module->try_lock()) {
 					std::vector<int> s(module->slices);
 					size_t nbSample = module->totalSampleCount;
 
@@ -833,6 +843,7 @@ struct CANARDDisplay : OpaqueWidget {
 struct CANARDWidget : BidooWidget {
 
 	CANARDWidget(CANARD *module) {
+		printf("CANARDWidget: module is %p\n", module);
 		setModule(module);
 		prepareThemes(asset::plugin(pluginInstance, "res/CANARD.svg"));
 
@@ -924,6 +935,7 @@ struct CANARDWidget : BidooWidget {
 			#if defined(METAMODULE)
 			async_osdialog_file(OSDIALOG_OPEN, dir.c_str(), NULL, NULL, [this](char *path) {
 				if (path) {
+					// printf("Load sample: module is %p\n", module);
 					module->lastPath = path;
 					module->loading=true;
 					free(path);
